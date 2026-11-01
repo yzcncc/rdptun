@@ -84,11 +84,6 @@ else
     PKG="rdptun-${VERSION}-linux-${HOST}.tar.gz"
     echo "==> downloading $PKG ..."
     fetch "$BASE/$PKG" "$TMP/pkg.tar.gz" || { echo "error: download failed" >&2; exit 1; }
-    # 校验 sha256（如果提供）
-    if fetch "$BASE/$PKG.sha256" "$TMP/pkg.sha256" 2>/dev/null; then
-        (cd "$TMP" && sed -i "s| .*$|  $PKG|" pkg.sha256 && sha256sum -c pkg.sha256 >/dev/null 2>&1) \
-            && echo "==> checksum OK" || echo "!! checksum check skipped/failed, continuing" >&2
-    fi
 fi
 
 echo "==> extracting..."
