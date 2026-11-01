@@ -61,7 +61,15 @@ elif have wget; then FETCH="wget -qO-";
 else echo "error: need curl or wget" >&2; exit 1; fi
 
 fetch() { # fetch <url> <outfile>
-    if have curl; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi
+    # 优先 curl，失败时回退 HTTP/1.1 与 wget（应对 HTTP/2 framing / 代理抖动）
+    if have curl; then
+        curl -fsSL --retry 3 --retry-delay 1 "$1" -o "$2" 2>/dev/null && return 0
+        curl -fsSL --http1.1 --retry 3 --retry-delay 1 "$1" -o "$2" 2>/dev/null && return 0
+    fi
+    if have wget; then
+        wget -q --tries=3 --timeout=20 -O "$2" "$1" && return 0
+    fi
+    return 1
 }
 
 # ---- 决定版本 ----
