@@ -48,7 +48,47 @@
 cargo build --release
 ```
 
-## 运行
+## 一键安装
+
+### 服务端（交互式向导）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yzcncc/rdptun/main/install-server.sh | sh
+```
+
+向导会询问监听地址、转发目标、NLA 账号密码、证书方式，然后安装二进制、
+写入 `/etc/rdptun/server.toml`（0600）、注册并启动 systemd 服务。
+
+非交互（脚本/CI）：
+
+```sh
+RDPTUN_BIND=0.0.0.0:3389 RDPTUN_TARGET=127.0.0.1:22 \
+RDPTUN_USER=operator RDPTUN_PASS='secret' \
+sh install-server.sh --yes
+```
+
+### 客户端（Docker + Dashboard）
+
+```sh
+docker run -d --name rdptun-client --restart unless-stopped \
+  -p 127.0.0.1:1080:1080 -p 127.0.0.1:8080:8080 \
+  -e RDPTUN_SERVER=your.server:3389 \
+  -e RDPTUN_USERNAME=operator -e RDPTUN_PASSWORD='secret' \
+  -v rdptun-data:/data \
+  ghcr.io/yzcncc/rdptun-client:latest
+```
+
+或 `docker compose up -d`（见 `docker-compose.yml`）。
+
+打开 <http://127.0.0.1:8080> 可：
+
+- 查看活动会话数、累计上下行字节、健康检查失败次数
+- 在线修改上游地址/账号/通道并即时生效（无需重启）
+- 一键测试上游连通性
+
+健康检查端点：`/healthz`（探测上游 RDP 可达性，供 `HEALTHCHECK` 用）、`/livez`。
+
+## 手动运行
 
 ```bash
 # 服务端（公网机器）

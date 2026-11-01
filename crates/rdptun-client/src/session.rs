@@ -31,14 +31,18 @@ struct RdpSession {
 }
 
 /// 每条本地 TCP 连接：完整 RDP 会话 + 桥接到服务端 target。
-pub async fn tunnel_one_connection(cfg: Arc<ClientConfig>, local_sock: TcpStream) -> Result<()> {
+pub async fn tunnel_one_connection(
+    cfg: ClientConfig,
+    local_sock: TcpStream,
+    stats: Arc<crate::dashboard::Stats>,
+) -> Result<()> {
     let session = connect_rdp(&cfg).await.context("RDP session setup")?;
     // CredSSP 状态机含 !Send 生成器 —— 整个会话在 LocalSet 上跑。
-    run_session(session, local_sock).await
+    run_session(session, local_sock, stats).await
 }
 
 /// 连接服务端并完成全部 RDP 握手（含 NLA）。
-async fn connect_rdp(cfg: &Arc<ClientConfig>) -> Result<RdpSession> {
+async fn connect_rdp(cfg: &ClientConfig) -> Result<RdpSession> {
     let stream = TcpStream::connect(&cfg.server)
         .await
         .with_context(|| format!("TCP connect to {}", cfg.server))?;
@@ -159,7 +163,7 @@ fn channel_name_of(name: &str) -> &str {
 async fn tls_upgrade<S>(
     stream: S,
     server_name: &str,
-    cfg: &Arc<ClientConfig>,
+    cfg: &ClientConfig,
 ) -> Result<(OwnedTlsStream, Vec<u8>)>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
@@ -201,7 +205,11 @@ fn server_host(addr: &str) -> &str {
 /// - 本地 TCP → 通道：任务 A 读 socket、包帧，投到通道出站队列；
 /// - 会话主循环：从通道出站队列取帧 → 编码 SVC → 发给服务端；
 ///   同时读服务端 PDU → ActiveStage 处理 → SVC 入站进通道 → 任务 B 写本地 TCP。
-async fn run_session(session: RdpSession, local_sock: TcpStream) -> Result<()> {
+async fn run_session(
+    session: RdpSession,
+    local_sock: TcpStream,
+    stats: Arc<crate::dashboard::Stats>,
+) -> Result<()> {
     let RdpSession {
         framed,
         result,
@@ -234,12 +242,14 @@ async fn run_session(session: RdpSession, local_sock: TcpStream) -> Result<()> {
 
     // ---- 任务 A：本地 TCP → 通道（包帧后排队）----
     let bridge_a = Arc::clone(&bridge);
+    let stats_up = Arc::clone(&stats);
     let to_channel = tokio::task::spawn_local(async move {
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match local_read.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    stats_up.add_up(n);
                     if bridge_a
                         .send_to_channel(rdptun_proto::encode_frame(&buf[..n]))
                         .await
@@ -255,8 +265,10 @@ async fn run_session(session: RdpSession, local_sock: TcpStream) -> Result<()> {
 
     // ---- 任务 B：通道 → 本地 TCP（服务端发来的数据写入本地 socket）----
     let bridge_b = Arc::clone(&bridge);
+    let stats_down = Arc::clone(&stats);
     let from_channel = tokio::task::spawn_local(async move {
         while let Some(data) = bridge_b.recv_from_channel().await {
+            stats_down.add_down(data.len());
             if local_write.write_all(&data).await.is_err() {
                 break;
             }

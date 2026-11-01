@@ -1,0 +1,35 @@
+services:
+  rdptun-client:
+    image: ghcr.io/yzcncc/rdptun-client:latest
+    # 或者本地构建：
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+    container_name: rdptun-client
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1080:1080"   # 代理端口（应用连这里）
+      - "127.0.0.1:8080:8080"   # Dashboard（浏览器打开 http://127.0.0.1:8080）
+    environment:
+      # 首次启动的默认配置；之后可在 Dashboard 里修改（会持久化到 volume）
+      RDPTUN_LISTEN: "0.0.0.0:1080"
+      RDPTUN_SERVER: "203.0.113.10:3389"   # ← 改成你的 rdptun-server 地址
+      RDPTUN_USERNAME: "operator"           # ← 与服务端 NLA 账号一致
+      RDPTUN_PASSWORD: "ChangeMe#2026"      # ← 与服务端 NLA 密码一致
+      RDPTUN_CHANNEL: "TUNNEL"
+      RDPTUN_CLIENT_NAME: "DESKTOP-RDPTUN"
+      RDPTUN_TRUST: "tofu"
+      RDPTUN_DASHBOARD: "0.0.0.0:8080"
+      # 可选：保护 Dashboard
+      # RDPTUN_DASHBOARD_TOKEN: "some-long-random-token"
+    volumes:
+      - rdptun-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  rdptun-data:
