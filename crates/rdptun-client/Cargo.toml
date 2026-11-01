@@ -1,0 +1,35 @@
+[package]
+name = "rdptun-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rdptun-client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+toml.workspace = true
+serde = { version = "1", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+ironrdp-async.workspace = true
+ironrdp-tokio.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-svc.workspace = true
+ironrdp-core.workspace = true
+ironrdp-connector.workspace = true
+ironrdp-graphics = "0.11"
+x509-cert.workspace = true
+ironrdp-session.workspace = true
+
+rdptun-proto = { path = "../rdptun-proto" }

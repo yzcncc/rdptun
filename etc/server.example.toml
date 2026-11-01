@@ -1,0 +1,35 @@
+# ============================================================
+# rdptun-server 配置示例
+# 对外呈现为一个开启了 NLA 的 Windows RDP 主机。
+# ============================================================
+
+# RDP 监听地址。生产建议 0.0.0.0:3389。
+bind = "0.0.0.0:3389"
+
+# 隧道目标：SVC 字节流原样转发到这个地址（如本机 sshd、内网 HTTP 等）。
+target = "127.0.0.1:22"
+
+# NLA (CredSSP/NTLM) 登录凭证 —— 客户端必须用这个账号密码才能建立隧道。
+username = "operator"
+password = "ChangeMe#2026"
+
+# 隧道 SVC 通道名（1-7 个字母数字字符，两端必须一致）。
+channel = "TUNNEL"
+
+# ---- 证书（二选一）----
+# 1) 自动生成 Windows 风格 RDP 自签名证书（默认，推荐）：
+#    Subject=Issuer=CN=<machine_name>，RSA-2048，sha256WithRSAEncryption，
+#    KU: digitalSignature|keyEncipherment（critical），EKU: ServerAuth，
+#    有效期 6 个月，临期自动续签，持久化在 cert_store_dir。
+cert_store_dir = "cert-store"
+machine_name = "DESKTOP-A1B2C3D"   # 缺省则随机生成 DESKTOP-XXXXXXX
+
+# 2) 显式指定 PEM 证书（配置了就优先用；PFX 请先转 PEM）：
+# cert_path = "/etc/rdptun/rdp-cert.pem"
+# key_path  = "/etc/rdptun/rdp-key.pem"
+
+# 最大并发 RDP 会话数（每条隧道连接占用一个会话）。
+max_sessions = 64
+
+# 虚拟桌面分辨率（伪装黑屏桌面，影响能力协商）。
+desktop_size = [1280, 720]

@@ -1,0 +1,6 @@
+/target
+/dist
+/etc/server.toml
+/etc/client.toml
+/cert-store
+*.pcap

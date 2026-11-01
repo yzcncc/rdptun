@@ -1,0 +1,85 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            host: x86_64
+          - target: aarch64-unknown-linux-gnu
+            host: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cross toolchain (aarch64)
+        if: matrix.host == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DIST=dist
+          mkdir -p $DIST
+          for bin in rdptun-server rdptun-client; do
+            SRC=target/${{ matrix.target }}/release/$bin
+            [ -f "$SRC" ] || SRC=target/release/$bin
+            cp "$SRC" $DIST/${bin}-linux-${{ matrix.host }}
+          done
+          # 打包
+          cd $DIST
+          tar czf rdptun-${VERSION}-linux-${{ matrix.host }}.tar.gz \
+            rdptun-server-linux-${{ matrix.host }} rdptun-client-linux-${{ matrix.host }} \
+            ../etc/server.example.toml ../etc/client.example.toml ../README.md
+          sha256sum rdptun-${VERSION}-linux-${{ matrix.host }}.tar.gz > rdptun-${VERSION}-linux-${{ matrix.host }}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdptun-linux-${{ matrix.host }}
+          path: dist/rdptun-*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/rdptun-*
+          generate_release_notes: true

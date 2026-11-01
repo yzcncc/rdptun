@@ -1,0 +1,34 @@
+[package]
+name = "rdptun-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rdptun-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+toml.workspace = true
+serde = { version = "1", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+bytes.workspace = true
+x509-cert.workspace = true
+async-trait.workspace = true
+
+ironrdp-acceptor.workspace = true
+ironrdp-async.workspace = true
+ironrdp-tokio.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-svc.workspace = true
+ironrdp-core.workspace = true
+
+rdptun-cert = { path = "../rdptun-cert" }
+rdptun-proto = { path = "../rdptun-proto" }

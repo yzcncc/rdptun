@@ -1,0 +1,256 @@
+//! rdptun 共享协议组件：隧道 SVC 通道处理器（客户端/服务端两侧通用）。
+
+use ironrdp_core::{Encode, EncodeResult, impl_as_any};
+use ironrdp_pdu::gcc::ChannelName;
+use ironrdp_pdu::{PduResult, pdu_other_err};
+use ironrdp_svc::{SvcEncode, SvcMessage, SvcProcessor};
+use tokio::sync::mpsc;
+
+/// 默认隧道通道名（SVC 通道名 ≤ 7 字符）。
+pub const DEFAULT_CHANNEL_NAME: &str = "TUNNEL";
+
+/// 校验 SVC 通道名（≤7 字节，字母数字）。
+pub fn validate_channel_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty() && name.len() <= 7,
+        "channel name must be 1-7 characters, got {name:?}"
+    );
+    anyhow::ensure!(
+        name.bytes().all(|b| b.is_ascii_alphanumeric()),
+        "channel name must be alphanumeric, got {name:?}"
+    );
+    Ok(())
+}
+
+/// `SvcEncode` 包装，把一段原始字节标记为完整的通道 PDU。
+#[derive(Debug)]
+pub struct RawTunnelPdu(pub Vec<u8>);
+
+impl Encode for RawTunnelPdu {
+    fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> EncodeResult<()> {
+        dst.write_slice(&self.0);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "RawTunnelPdu"
+    }
+
+    fn size(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl SvcEncode for RawTunnelPdu {}
+
+/// 一段经隧道传输的应用数据（已重组为完整帧载荷）。
+pub type TunnelData = Vec<u8>;
+
+/// 隧道 SVC 通道的两端点。
+///
+/// 数据流（以客户端为例，服务端方向对称）：
+///
+/// ```text
+/// 本地 TCP socket
+///   │ 读
+///   ▼
+/// endpoint.tcp_to_channel (mpsc)          ← 桥接任务投递
+///   │
+///   ▼
+/// 会话循环取出 → encode_frame → SVC 发送   ← 会话循环（单线程持有 ActiveStage）
+///   │
+///   ▼ RDP 传输
+/// 对端 process() → decode 帧 →
+/// endpoint.channel_to_tcp (mpsc)          ← process() 投递
+///   │
+///   ▼
+/// 桥接任务取出 → 写入对端 TCP socket
+/// ```
+#[derive(Debug)]
+pub struct TunnelChannel {
+    channel_name: ChannelName,
+    /// 本地 TCP → 对端的队列发送端（会话循环消费接收端）。
+    tcp_to_channel_tx: mpsc::Sender<TunnelData>,
+    /// 会话循环持有的接收端。
+    tcp_to_channel_rx: tokio::sync::Mutex<mpsc::Receiver<TunnelData>>,
+    /// `process()` 投递用的发送端（对端 → 本地 TCP）。
+    channel_to_tcp_tx: mpsc::UnboundedSender<TunnelData>,
+}
+
+/// 创建隧道通道与桥接端点。
+pub fn new_tunnel_channel(channel_name: &str) -> anyhow::Result<(TunnelChannel, TunnelBridge)> {
+    validate_channel_name(channel_name)?;
+    let name = ChannelName::from_utf8(channel_name).ok_or_else(|| anyhow::anyhow!("invalid channel name {channel_name:?}"))?;
+
+    // 通道 → TCP：process() 同步投递，用 try_send 有界队列；满时背压由
+    // SVC chunk 化 + TCP 慢造成，直接丢帧会破坏流语义，因此用较大队列 +
+    // 阻塞语义不可行（process 非 async）——选择 unbounded + 会话/桥接端
+    // 主动退出时自然收敛。RDP 会话本身有序可靠，桥接消费速度通常高于
+    // 链路速度，队列不会无限增长。
+    let (channel_to_tcp_tx, channel_to_tcp_rx) = mpsc::unbounded_channel::<TunnelData>();
+    // TCP → 通道：有界队列提供背压，TCP 读太快时桥接任务阻塞。
+    let (tcp_to_channel_tx, tcp_to_channel_rx) = mpsc::channel::<TunnelData>(128);
+
+    let channel = TunnelChannel {
+        channel_name: name,
+        tcp_to_channel_tx: tcp_to_channel_tx.clone(),
+        tcp_to_channel_rx: tokio::sync::Mutex::new(tcp_to_channel_rx),
+        channel_to_tcp_tx,
+    };
+    let bridge = TunnelBridge {
+        tcp_to_channel_tx,
+        channel_to_tcp_rx: tokio::sync::Mutex::new(channel_to_tcp_rx),
+    };
+    Ok((channel, bridge))
+}
+
+impl TunnelChannel {
+    /// 通道名（会话层发送时定位通道用）。
+    pub fn tunnel_channel_name(&self) -> &str {
+        self.channel_name.as_str().unwrap_or("TUNNEL")
+    }
+
+    /// 会话循环：取出一段待发送到对端的数据（已含长度前缀）。
+    ///
+    /// 返回 `None` 表示桥接任务已退出（TCP 侧断开），会话可以结束。
+    pub async fn take_outbound(&self) -> Option<TunnelData> {
+        self.tcp_to_channel_rx.lock().await.recv().await
+    }
+
+    /// 会话循环：把桥接任务投递的数据排队发送（已在桥接端完成）。
+    ///
+    /// 此方法由 SVC `process()` 路径间接调用。
+    fn deliver_to_bridge(&self, data: TunnelData) {
+        // unbounded，且桥接端退出时 send 返回 Err，直接丢弃。
+        let _ = self.channel_to_tcp_tx.send(data);
+    }
+}
+
+impl SvcProcessor for TunnelChannel {
+    fn channel_name(&self) -> ChannelName {
+        self.channel_name.clone()
+    }
+
+    fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
+        Ok(Vec::new())
+    }
+
+    fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
+        // 入站：对端发来的长度前缀帧（可能一帧或多帧粘连）。
+        // 重组后按帧边界投递给桥接任务（写入 TCP）。
+        let mut pos = 0usize;
+        while pos < payload.len() {
+            if payload.len() - pos < 4 {
+                tracing::warn!("truncated tunnel frame header ({} bytes)", payload.len() - pos);
+                return Err(pdu_other_err!("truncated tunnel frame header"));
+            }
+            let len = u32::from_le_bytes([
+                payload[pos],
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
+            ]) as usize;
+            if len > MAX_FRAME_SIZE {
+                tracing::warn!("tunnel frame too large: {len}");
+                return Err(pdu_other_err!("tunnel frame too large: {len}"));
+            }
+            let start = pos + 4;
+            if start + len > payload.len() {
+                tracing::warn!(
+                    "truncated tunnel frame body: need {len}, have {}",
+                    payload.len() - start
+                );
+                return Err(pdu_other_err!("truncated tunnel frame body"));
+            }
+            self.deliver_to_bridge(payload[start..start + len].to_vec());
+            pos = start + len;
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl_as_any!(TunnelChannel);
+
+// 客户端侧标记
+impl ironrdp_svc::SvcClientProcessor for TunnelChannel {}
+// 服务端侧标记
+impl ironrdp_svc::SvcServerProcessor for TunnelChannel {}
+
+/// TCP 桥接端点：连接 SVC 通道与 TCP socket。
+pub struct TunnelBridge {
+    /// 本地 TCP → 对端的发送端（桥接任务投递）。
+    tcp_to_channel_tx: mpsc::Sender<TunnelData>,
+    /// 对端 → 本地 TCP 的接收端（桥接任务消费）。
+    channel_to_tcp_rx: tokio::sync::Mutex<mpsc::UnboundedReceiver<TunnelData>>,
+}
+
+impl TunnelBridge {
+    /// 桥接任务：把 TCP 读到的一段数据排队交给会话循环编码发送。
+    pub async fn send_to_channel(&self, data: TunnelData) -> anyhow::Result<()> {
+        anyhow::ensure!(!data.is_empty(), "empty write");
+        self.tcp_to_channel_tx
+            .send(data)
+            .await
+            .map_err(|_| anyhow::anyhow!("tunnel channel closed"))
+    }
+
+    /// 桥接任务：取出对端发来、待写入 TCP 的数据。
+    ///
+    /// 返回 `None` 表示 RDP 会话已结束。
+    pub async fn recv_from_channel(&self) -> Option<TunnelData> {
+        self.channel_to_tcp_rx.lock().await.recv().await
+    }
+}
+
+/// 单帧上限（16 MiB），防止恶意长度头耗尽内存。
+pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// 编码为长度前缀帧。
+pub fn encode_frame(data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_name_validation() {
+        assert!(validate_channel_name("TUNNEL").is_ok());
+        assert!(validate_channel_name("ABC1234").is_ok());
+        assert!(validate_channel_name("").is_err());
+        assert!(validate_channel_name("TOOLONGNAME").is_err());
+        assert!(validate_channel_name("WITH SPACE").is_err());
+    }
+
+    #[test]
+    fn encode_frame_layout() {
+        let f = encode_frame(b"abc");
+        assert_eq!(&f[..4], &3u32.to_le_bytes());
+        assert_eq!(&f[4..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn processor_routes_inbound_to_bridge() {
+        let (mut channel, bridge) = new_tunnel_channel("TUNNEL").unwrap();
+        assert_eq!(channel.tunnel_channel_name(), "TUNNEL");
+
+        let mut payload = encode_frame(b"hello");
+        payload.extend_from_slice(&encode_frame(&[1, 2, 3]));
+        let out = channel.process(&payload).unwrap();
+        assert!(out.is_empty());
+
+        assert_eq!(bridge.recv_from_channel().await.unwrap(), b"hello".to_vec());
+        assert_eq!(bridge.recv_from_channel().await.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn bridge_to_session_outbound() {
+        let (channel, bridge) = new_tunnel_channel("TUNNEL").unwrap();
+        bridge.send_to_channel(vec![9, 9]).await.unwrap();
+        assert_eq!(channel.take_outbound().await.unwrap(), vec![9, 9]);
+    }
+}

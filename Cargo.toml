@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rdptun-cert",
+    "crates/rdptun-proto",
+    "crates/rdptun-server",
+    "crates/rdptun-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+bytes = "1"
+rcgen = { version = "0.14", default-features = false, features = ["pem", "aws_lc_rs"] }
+x509-cert = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+async-trait = "0.1"
+
+ironrdp-acceptor = "0.12"
+ironrdp-server = "0.13"
+ironrdp-connector = "0.12"
+ironrdp-session = "0.13"
+ironrdp-svc = "0.10"
+ironrdp-tokio = { version = "0.12", features = ["reqwest"] }
+ironrdp-pdu = "0.11"
+ironrdp-async = "0.12"
+ironrdp-core = "0.3"
+
+[profile.release]
+lto = "thin"

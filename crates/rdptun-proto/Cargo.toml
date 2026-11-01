@@ -1,0 +1,13 @@
+[package]
+name = "rdptun-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+ironrdp-svc.workspace = true
+ironrdp-core.workspace = true
+ironrdp-pdu.workspace = true
+tracing.workspace = true
