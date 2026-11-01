@@ -58,6 +58,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 COPY crates ./crates
 
+# 关键：占位 main.rs 与真实源码同名，必须让 cargo 判定源码已更新，
+# 否则会复用占位阶段生成的空二进制。
+RUN set -eux; \
+    find crates -name '*.rs' -exec touch {} +; \
+    touch Cargo.toml crates/*/Cargo.toml
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     set -eux; \
