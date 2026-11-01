@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "rdptun-cert"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "rand 0.8.8",
@@ -2392,7 +2392,7 @@ dependencies = [
 
 [[package]]
 name = "rdptun-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "rdptun-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "ironrdp-core",
@@ -2433,7 +2433,7 @@ dependencies = [
 
 [[package]]
 name = "rdptun-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
