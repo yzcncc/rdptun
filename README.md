@@ -75,7 +75,7 @@ docker run -d --name rdptun-client --restart unless-stopped \
   -e RDPTUN_SERVER=your.server:3389 \
   -e RDPTUN_USERNAME=operator -e RDPTUN_PASSWORD='secret' \
   -v rdptun-data:/data \
-  ghcr.io/yzcncc/rdptun-client:latest
+  ghcr.io/yzcncc/rdptun-client:latest  # 或 :0.2.1 / :0.2
 ```
 
 或 `docker compose up -d`（见 `docker-compose.yml`）。
