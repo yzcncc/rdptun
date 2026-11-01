@@ -47,8 +47,8 @@ RUN set -eux; \
         printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' > .cargo/config.toml; \
     fi
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/src/target \
     set -eux; \
     if [ "$TARGETARCH" = "arm64" ]; then \
         cargo build --release --target aarch64-unknown-linux-gnu -p rdptun-client || true; \
@@ -64,8 +64,8 @@ RUN set -eux; \
     find crates -name '*.rs' -exec touch {} +; \
     touch Cargo.toml crates/*/Cargo.toml
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/src/target \
     set -eux; \
     if [ "$TARGETARCH" = "arm64" ]; then \
         cargo build --release --target aarch64-unknown-linux-gnu -p rdptun-client; \
