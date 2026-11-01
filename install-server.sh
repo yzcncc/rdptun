@@ -181,6 +181,11 @@ else
         if fetch "$API" "$TMP/rel.json" 2>/dev/null; then
             VERSION=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$TMP/rel.json" | head -1)
         fi
+        # API 失败（限流/网络）时回退：跟随 releases/latest 的重定向得到 tag
+        if [ -z "$VERSION" ] && have curl; then
+            VERSION=$(curl -fsSI --http1.1 "https://github.com/$REPO/releases/latest" 2>/dev/null \
+                | tr -d '\r' | sed -n 's|.*/releases/tag/\([^ ]*\)$|\1|p' | head -1)
+        fi
         [ -n "$VERSION" ] || { echo "error: 无法获取最新版本，请用 --version 指定" >&2; exit 1; }
     fi
     echo "    版本: $VERSION"
