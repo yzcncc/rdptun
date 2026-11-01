@@ -2,24 +2,34 @@
 # ============================================================
 # rdptun-client Docker 镜像（多架构：amd64 / arm64）
 #
-# 采用 TARGETPLATFORM 原生构建（arm64 在 QEMU 模拟下编译），
-# 避免交叉编译 aws-lc-sys 时 jitterentropy 的头文件/工具链问题。
+# amd64 在构建平台上直接编译；arm64 用 aarch64 交叉工具链编译
+# （aws-lc-sys 需要 cmake/perl + 目标 libc 头文件）。
 # ============================================================
 
-FROM rust:1-bookworm AS builder
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 
 ARG TARGETARCH
 
 WORKDIR /src
 
-# 复制清单以缓存依赖层
+# 依赖工具：amd64 只需 cmake/perl；arm64 额外要交叉 gcc 与目标架构头文件
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends cmake perl pkg-config; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        dpkg --add-architecture arm64 || true; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+    fi; \
+    rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates/rdptun-cert/Cargo.toml crates/rdptun-cert/
 COPY crates/rdptun-proto/Cargo.toml crates/rdptun-proto/
 COPY crates/rdptun-server/Cargo.toml crates/rdptun-server/
 COPY crates/rdptun-client/Cargo.toml crates/rdptun-client/
 
-# 占位源文件，先编译依赖
 RUN set -eux; \
     for d in rdptun-cert rdptun-proto rdptun-server rdptun-client; do \
         mkdir -p crates/$d/src; \
@@ -29,17 +39,35 @@ RUN set -eux; \
         esac; \
     done
 
+# 目标架构与交叉链接器配置
+RUN set -eux; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        rustup target add aarch64-unknown-linux-gnu; \
+        mkdir -p .cargo; \
+        printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' > .cargo/config.toml; \
+    fi
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p rdptun-client || true
+    set -eux; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        cargo build --release --target aarch64-unknown-linux-gnu -p rdptun-client || true; \
+    else \
+        cargo build --release -p rdptun-client || true; \
+    fi
 
-# 真实源码
 COPY crates ./crates
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p rdptun-client \
-    && cp target/release/rdptun-client /rdptun-client
+    set -eux; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        cargo build --release --target aarch64-unknown-linux-gnu -p rdptun-client; \
+        cp target/aarch64-unknown-linux-gnu/release/rdptun-client /rdptun-client; \
+    else \
+        cargo build --release -p rdptun-client; \
+        cp target/release/rdptun-client /rdptun-client; \
+    fi
 
 # ---- 运行阶段 ----
 FROM debian:bookworm-slim
