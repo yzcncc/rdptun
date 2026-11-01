@@ -29,10 +29,24 @@
 
 | 层 | 表现 |
 |---|---|
-| X.224 协商 | 仅接受 `PROTOCOL_HYBRID\|HYBRID_EX`；对 `PROTOCOL_RDP` 探测回标准 Negotiation Failure（同关闭了传统 RDP 安全的 Windows） |
-| TLS | rustls TLS 1.2/1.3；证书为 Windows TermService 风格自签名（CN=机器名、RSA-2048、sha256RSA、KU critical、EKU ServerAuth、无 SAN、6 个月有效期、临期自动续签） |
+| X.224 协商 | 客户端 offer `SSL\|HYBRID\|HYBRID_EX` 时返回 `PROTOCOL_HYBRID_EX`（0x08），与实测 WinServer 2019 逐字节一致；对 `PROTOCOL_RDP` 探测回标准 Negotiation Failure |
+| TLS | **锁定 TLS 1.2**，优先 ECDHE-RSA-AES256-GCM（对齐 Windows RDP 栈，避免 TLS 1.3 指纹暴露）；证书为 Windows TermService 风格自签名（CN=机器名、RSA-2048、sha256RSA、KU critical、EKU ServerAuth、无 SAN、6 个月有效期、临期自动续签） |
 | NLA | 完整 CredSSP/NTLM（NTLMv2 指纹呈现 Windows 10.0.17763），nmap `rdp-ntlm-info` 可读到 Product_Version |
-| 会话期 | 标准 MCS/能力交换/licensing；Server Heartbeat PDU 仅在客户端宣告支持时按 MS-RDPBCGR 2.2.16.1 发送 |
+| 会话期 | 标准 MCS/能力交换/licensing；Server Heartbeat PDU 仅在客户端宣告支持时按 MS-RDPBCGR 2.2.16.1 发送（实测 Windows 空闲时也不发周期心跳） |
+
+### 与真实 mstsc↔WinServer 抓包校准结论
+
+用 `tcpdump` 抓取真实 mstsc 连接 Windows Server 2019（含 15 秒高分辨率视频）的
+66 秒样本后，逐项比对了服务端行为：
+
+| 项目 | 真实 Windows | rdptun |
+|---|---|---|
+| X.224 selected protocol | `0x08` (HYBRID_EX) | `0x08` ✓ |
+| TLS 版本 | TLS 1.2 | TLS 1.2 ✓ |
+| Cipher | ECDHE-RSA-AES256-CBC-SHA (0xc028) | ECDHE-RSA-AES256-GCM (rustls 无 CBC) |
+| 证书 | 单张 RSA-2048，742 B DER | 单张 RSA-2048，792 B DER |
+| 空闲期心跳 | 无周期心跳 | 同（客户端未宣告则不发送） |
+| 会话期包型 | 1460/1701/241 B 为主（图形流） | 隧道数据，无图形流 |
 
 用 `nmap -sV --script rdp-ntlm-info,rdp-enum-encryption -p 3389` 实测：
 
@@ -121,8 +135,22 @@ curl -x '' http://127.0.0.1:1080/        # 任何 TCP 协议
 - mstsc 走 NLA 时需输入服务端配置的账号（本地账号格式 `.\user`）；不支持域认证。
 - 每连接一次完整握手；SVC chunk ~1600B/PDU，吞吐对实验室场景足够。
 - TLS 指纹（JA3）是 rustls 而非 schannel —— 如需对齐可后续调整 cipher suite。
-- 会话期图形面：当前服务端不推送黑屏位图更新（mstsc 连上会看到空桌面）。
-  流量节奏校准（帧间隔/熵值分布）待接入真实 mstsc 抓包样本后完善。
+- 会话期图形面：当前服务端不推送黑屏位图更新（mstsc 连上会看到空桌面），
+  因此会话期服务端方向只有隧道数据，缺少真实 RDP 的图形更新包型（1460/1701B 为主）。
+  这是与真实流量最大的剩余差异；要做需实现 bitmap update 编码与帧节奏仿真。
+- rustls 不支持 CBC cipher（0xc028），TLS 指纹层面存在这一处可识别差异。
+- musl 全静态构建在 `aws-lc-sys` 下运行时段错误，故只发布 glibc 动态版。
+
+## 仓库与发布
+
+- 仓库：<https://github.com/yzcncc/rdptun>（公开）
+- Release 产物：`rdptun-vX.Y.Z-linux-{x86_64,aarch64}.tar.gz`
+- 容器镜像：`ghcr.io/yzcncc/rdptun-client`（tag：`latest` / `X.Y.Z` / `X.Y`，多架构 amd64+arm64）
+
+CI（GitHub Actions）：
+- `ci.yml` — push/PR 跑测试 + 双架构 release 构建
+- `release.yml` — 推 `v*` tag 自动构建并上传 Release 资产
+- `docker.yml` — 构建多架构镜像并推 GHCR
 
 ## 代码结构
 

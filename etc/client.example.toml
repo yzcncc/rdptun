@@ -26,3 +26,11 @@ client_name = "DESKTOP-RDPTUN"
 trust = "tofu"
 tofu_store = "cert-store/client-known-hosts"
 # pin_spki_sha256 = "ab12cd34..."
+
+# ---- 内置 Web Dashboard ----
+# 监听地址（Docker 中通常为 0.0.0.0:8080）。浏览器打开可查看状态、
+# 在线修改上游配置、执行健康检查。
+dashboard = "127.0.0.1:8080"
+# 访问令牌（可选）。设置后 API 需要 `Authorization: Bearer <token>`；
+# 暴露到非本机网络时强烈建议设置。
+# dashboard_token = "change-me-to-a-long-random-string"
