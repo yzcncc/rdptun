@@ -69,8 +69,6 @@ pub type TunnelData = Vec<u8>;
 #[derive(Debug)]
 pub struct TunnelChannel {
     channel_name: ChannelName,
-    /// 本地 TCP → 对端的队列发送端（会话循环消费接收端）。
-    tcp_to_channel_tx: mpsc::Sender<TunnelData>,
     /// 会话循环持有的接收端。
     tcp_to_channel_rx: tokio::sync::Mutex<mpsc::Receiver<TunnelData>>,
     /// `process()` 投递用的发送端（对端 → 本地 TCP）。
@@ -93,7 +91,6 @@ pub fn new_tunnel_channel(channel_name: &str) -> anyhow::Result<(TunnelChannel, 
 
     let channel = TunnelChannel {
         channel_name: name,
-        tcp_to_channel_tx: tcp_to_channel_tx.clone(),
         tcp_to_channel_rx: tokio::sync::Mutex::new(tcp_to_channel_rx),
         channel_to_tcp_tx,
     };
@@ -199,6 +196,33 @@ impl TunnelBridge {
     /// 返回 `None` 表示 RDP 会话已结束。
     pub async fn recv_from_channel(&self) -> Option<TunnelData> {
         self.channel_to_tcp_rx.lock().await.recv().await
+    }
+}
+
+/// 长连接套接字调优：让"静默死亡"的连接（丢包/NAT 超时后收不到 RST）
+/// 能在约 2 分钟内被发现，而不是让会话任务永久挂起。
+pub mod net {
+    use std::io;
+    use std::time::Duration;
+
+    /// 对 TCP 套接字启用 keepalive（空闲 60s 后每 10s 探测，5 次失败判死）
+    /// 与 TCP_USER_TIMEOUT（120s，限制重传无进展时的挂起时长，Linux）。
+    pub fn tune_long_lived<S>(stream: &S) -> io::Result<()>
+    where
+        S: std::os::fd::AsFd,
+    {
+        use socket2::SockRef;
+
+        let sock = SockRef::from(stream);
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
+        #[cfg(target_os = "linux")]
+        let ka = ka.with_retries(5);
+        sock.set_tcp_keepalive(&ka)?;
+        #[cfg(target_os = "linux")]
+        sock.set_tcp_user_timeout(Some(Duration::from_secs(120)))?;
+        Ok(())
     }
 }
 

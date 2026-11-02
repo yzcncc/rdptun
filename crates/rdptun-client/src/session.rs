@@ -2,11 +2,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use ironrdp_connector::{ClientConnector, Config as ConnectorConfig, Credentials as ConnectorCredentials};
 use ironrdp_pdu::gcc::KeyboardType;
-use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
+use ironrdp_session::{ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_async::FramedWrite as _;
 use ironrdp_tokio::TokioFramed;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
@@ -14,7 +15,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info};
 
 use crate::config::ClientConfig;
-use rdptun_proto::{TunnelBridge, TunnelChannel};
+use rdptun_proto::TunnelBridge;
 
 /// 擦除具体 TLS 类型的流别名。
 pub type OwnedTlsStream = Box<dyn AsyncReadWrite>;
@@ -30,23 +31,33 @@ struct RdpSession {
     channel_name: String,
 }
 
+/// TCP 连接超时。
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 完整 RDP 握手（X.224→TLS→NLA→finalize）超时。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// 每条本地 TCP 连接：完整 RDP 会话 + 桥接到服务端 target。
 pub async fn tunnel_one_connection(
     cfg: ClientConfig,
     local_sock: TcpStream,
     stats: Arc<crate::dashboard::Stats>,
 ) -> Result<()> {
-    let session = connect_rdp(&cfg).await.context("RDP session setup")?;
+    let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect_rdp(&cfg))
+        .await
+        .map_err(|_| anyhow::anyhow!("RDP handshake timed out after {}s", HANDSHAKE_TIMEOUT.as_secs()))?
+        .context("RDP session setup")?;
     // CredSSP 状态机含 !Send 生成器 —— 整个会话在 LocalSet 上跑。
     run_session(session, local_sock, stats).await
 }
 
 /// 连接服务端并完成全部 RDP 握手（含 NLA）。
 async fn connect_rdp(cfg: &ClientConfig) -> Result<RdpSession> {
-    let stream = TcpStream::connect(&cfg.server)
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&cfg.server))
         .await
+        .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out after {}s", cfg.server, CONNECT_TIMEOUT.as_secs()))?
         .with_context(|| format!("TCP connect to {}", cfg.server))?;
     stream.set_nodelay(true).ok();
+    rdptun_proto::net::tune_long_lived(&stream).ok();
     let client_addr: SocketAddr = stream.local_addr()?;
 
     // 1. 构造 connector（强制 NLA）
@@ -218,6 +229,7 @@ async fn run_session(
     } = session;
 
     local_sock.set_nodelay(true).ok();
+    rdptun_proto::net::tune_long_lived(&local_sock).ok();
     let (mut local_read, mut local_write) = tokio::io::split(local_sock);
 
     let (mut reader, mut writer) = ironrdp_tokio::split_tokio_framed(framed);
@@ -234,58 +246,34 @@ async fn run_session(
     }
     .build();
 
-    // 隧道通道处理器的引用（在 static_channels 里，downcast 取出）。
-    // take_outbound 需要 &self（内部 Mutex），可安全共享。
     let channel_name_obj = ironrdp_pdu::gcc::ChannelName::from_utf8(&channel_name).context("channel name")?;
 
     let bridge = Arc::new(bridge);
 
-    // ---- 任务 A：本地 TCP → 通道（包帧后排队）----
-    let bridge_a = Arc::clone(&bridge);
-    let stats_up = Arc::clone(&stats);
-    let to_channel = tokio::task::spawn_local(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        loop {
-            match local_read.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    stats_up.add_up(n);
-                    if bridge_a
-                        .send_to_channel(rdptun_proto::encode_frame(&buf[..n]))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        }
-        debug!("local socket closed (read side)");
-    });
-
-    // ---- 任务 B：通道 → 本地 TCP（服务端发来的数据写入本地 socket）----
-    let bridge_b = Arc::clone(&bridge);
-    let stats_down = Arc::clone(&stats);
-    let from_channel = tokio::task::spawn_local(async move {
-        while let Some(data) = bridge_b.recv_from_channel().await {
-            stats_down.add_down(data.len());
-            if local_write.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-        let _ = local_write.shutdown().await;
-        debug!("local socket closed (write side)");
-    });
-
     // ---- 会话主循环 ----
+    //
+    // 三路 select，本地 socket 的读写内联在主循环里（不再拆成独立任务），
+    // 这样任何一侧 EOF/错误都能立刻结束会话，不会泄漏半死的会话：
+    //
+    // 1. RDP 读：服务端 PDU → ActiveStage 处理（SVC 入站经 TunnelChannel
+    //    处理器投递到 bridge 队列）；
+    // 2. 本地读：应用数据 → 包帧 → 编码 SVC → 发给服务端；EOF → 结束会话
+    //    （RDP 关闭，服务端随之关闭 target，target 收到 FIN）；
+    // 3. bridge 收：target 数据 → 写本地 socket；空帧 = target EOF →
+    //    半关闭本地写端，继续转发 client→server 方向。
     let mut image = ironrdp_session::image::DecodedImage::new(
         ironrdp_graphics::image_processing::PixelFormat::RgbA32,
         result.desktop_size.width,
         result.desktop_size.height,
     );
-    let _ = &channel_name_obj;
 
     let mut running = true;
+    // 收到 target 的 EOF（空帧）后本地写端已半关闭。
+    let mut remote_eof = false;
+    // 本地读端已 EOF（应用关闭了连接）。
+    let mut local_eof = false;
+    let mut buf = vec![0u8; 16 * 1024];
+
     while running {
         let outputs = tokio::select! {
             frame = reader.read_pdu() => {
@@ -301,20 +289,25 @@ async fn run_session(
                         }
                     }
                     Err(e) => {
-                        debug!(error = %e, "read failed");
+                        debug!(error = %e, "rdp read failed");
                         running = false;
                         Vec::new()
                     }
                 }
             }
 
-            frame = recv_tunnel_outbound(&mut active_stage, &channel_name) => {
-                // 本地 TCP → 服务端方向：从隧道通道的出站队列取一帧，
-                // 编码成 SVC PDU 发送。
-                match frame {
-                    Some(data) => {
+            // 本地应用 → 服务端（内联，EOF 立即结束会话）
+            read = local_read.read(&mut buf), if !local_eof => {
+                match read {
+                    Ok(0) | Err(_) => {
+                        debug!("local socket EOF, ending session (target will see FIN)");
+                        running = false;
+                        Vec::new()
+                    }
+                    Ok(n) => {
+                        stats.add_up(n);
                         let svc_msg: Vec<ironrdp_svc::SvcMessage> =
-                            vec![rdptun_proto::RawTunnelPdu(data).into()];
+                            vec![rdptun_proto::RawTunnelPdu(rdptun_proto::encode_frame(&buf[..n])).into()];
                         match active_stage.process_svc_messages_by_name(&channel_name_obj, svc_msg) {
                             Ok(encoded) if !encoded.is_empty() => vec![ActiveStageOutput::ResponseFrame(encoded)],
                             Ok(_) => Vec::new(),
@@ -325,8 +318,30 @@ async fn run_session(
                             }
                         }
                     }
+                }
+            }
+
+            // 服务端/target → 本地应用
+            data = bridge.recv_from_channel() => {
+                match data {
+                    Some(d) if d.is_empty() && !remote_eof => {
+                        // 空帧 = target EOF → 半关闭本地写端。
+                        debug!("target EOF received, half-closing local write side");
+                        remote_eof = true;
+                        let _ = local_write.shutdown().await;
+                        Vec::new()
+                    }
+                    Some(_d) if remote_eof => Vec::new(), // EOF 后的残余，忽略
+                    Some(d) => {
+                        stats.add_down(d.len());
+                        if local_write.write_all(&d).await.is_err() {
+                            debug!("local write failed, ending session");
+                            running = false;
+                        }
+                        Vec::new()
+                    }
                     None => {
-                        // 隧道通道关闭（本地 TCP 断开）→ 结束会话。
+                        debug!("tunnel channel closed");
                         running = false;
                         Vec::new()
                     }
@@ -353,18 +368,9 @@ async fn run_session(
     }
 
     debug!("tunnel session ending");
-    to_channel.abort();
-    from_channel.abort();
 
     let (mut inner, _) = writer.into_inner();
     let _ = inner.shutdown().await;
 
     Ok(())
-}
-
-/// 从 ActiveStage 里的隧道通道处理器取出一条出站帧（本地 → 服务端方向）。
-async fn recv_tunnel_outbound(stage: &mut ActiveStage, channel_name: &str) -> Option<Vec<u8>> {
-    let processor = stage.get_svc_processor_mut::<TunnelChannel>()?;
-    // TunnelChannel::take_outbound 是 &self（内部 Mutex），通过 &mut 拿引用即可。
-    processor.take_outbound().await
 }

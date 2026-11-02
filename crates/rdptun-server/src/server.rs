@@ -196,6 +196,7 @@ where
         .await
         .with_context(|| format!("connect to target {}", cfg.target))?;
     target.set_nodelay(true).ok();
+    rdptun_proto::net::tune_long_lived(&target).ok();
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let user_channel_id = result.user_channel_id;
@@ -258,6 +259,10 @@ where
                 }
             }
         }
+        // target 关闭 → 通知客户端（长度为 0 的帧 = EOF 标记）。
+        // 注意：不能发空 SVC PDU（0 字节载荷会被通道分片层丢弃），
+        // 所以发送 encode_frame(&[]) —— 4 字节头、载荷为空。
+        let _ = bridge_b.send_to_channel(rdptun_proto::encode_frame(&[])).await;
     });
 
     // ---- 会话主循环 ----

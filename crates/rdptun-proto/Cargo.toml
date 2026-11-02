@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+socket2 = "0.6"
 ironrdp-svc.workspace = true
 ironrdp-core.workspace = true
 ironrdp-pdu.workspace = true
