@@ -4,6 +4,7 @@
 //! 并在数据阶段把自定义 SVC 通道桥接到固定 TCP 目标。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use ironrdp_acceptor::{Acceptor, AcceptorResult, BeginResult, DesktopSize};
@@ -18,7 +19,6 @@ use ironrdp_pdu::{Action, PduResult, mcs as mcs_pdu, nego, rdp};
 use ironrdp_svc::server_encode_svc_messages;
 use ironrdp_tokio::{FramedRead, FramedWrite, TokioFramed, split_tokio_framed};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfig;
@@ -76,19 +76,20 @@ fn server_capabilities(size: DesktopSize) -> Vec<CapabilitySet> {
     ]
 }
 
+/// 握手阶段（X.224 → TLS → CredSSP → finalize）的整体超时。
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 单个已认证连接的完整生命周期。
 pub async fn run_connection<S>(
     stream: S,
     cfg: Arc<ServerConfig>,
     tls: Arc<tokio_rustls::TlsAcceptor>,
     pub_key: Vec<u8>,
-    sessions: Arc<Semaphore>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static,
 {
-    let _permit = sessions.acquire_owned().await.context("session semaphore closed")?;
-
     let framed = TokioFramed::new(stream);
     let size = DesktopSize {
         width: cfg.desktop_size.0,
@@ -112,6 +113,9 @@ where
     let (tunnel_channel, bridge) = rdptun_proto::new_tunnel_channel(&cfg.channel)?;
     acceptor.attach_static_channel(tunnel_channel);
 
+    // 握手阶段整体超时：丢包路径上客户端放弃握手（FIN 丢失/NAT 回收）时，
+    // 服务端不能无限期占着会话许可槽等下去。
+    let handshake = async {
     // 1. X.224 协商
     let res = ironrdp_acceptor::accept_begin(framed, &mut acceptor)
         .await
@@ -159,6 +163,13 @@ where
     );
 
     // 5. 数据阶段：SVC 桥接 + 维持会话
+    Ok((framed, result, cfg, bridge))
+    };
+
+    let (framed, result, cfg, bridge) = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| anyhow::anyhow!("handshake timed out after {}s", HANDSHAKE_TIMEOUT.as_secs()))??;
+
     session_loop(framed, result, cfg, bridge).await
 }
 
@@ -276,12 +287,31 @@ where
         None
     };
 
+    // 链路保活：客户端静默 45s 后发送 SVC PING；连续 3 次无任何入站流量
+    // 判定客户端已死，结束会话回收许可槽。PONG/任何 PDU 都会重置计时。
+    // 这同时保证 NAT/conntrack 映射不会因空闲而被丢弃。
+    const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(45);
+    const MAX_UNANSWERED_PINGS: u32 = 3;
+    let mut next_ping_at = tokio::time::Instant::now() + PING_INTERVAL;
+    let mut unanswered_pings: u32 = 0;
+    // 可选的硬性空闲上限（配置 idle_timeout_secs；0 = 不启用）。
+    let idle_deadline = if cfg.idle_timeout_secs > 0 {
+        Some(std::time::Duration::from_secs(cfg.idle_timeout_secs))
+    } else {
+        None
+    };
+    let mut last_inbound = tokio::time::Instant::now();
+
     let mut running = true;
     while running {
         tokio::select! {
             read_res = reader.read_pdu() => {
                 match read_res {
                     Ok((action, bytes)) => {
+                        // 任何入站流量都证明客户端存活，重置保活计时。
+                        last_inbound = tokio::time::Instant::now();
+                        next_ping_at = last_inbound + PING_INTERVAL;
+                        unanswered_pings = 0;
                         match handle_client_pdu(action, &bytes, io_channel_id, user_channel_id, tunnel_channel_id, &mut static_channels, &mut writer).await {
                             Ok(true) => {}            // continue
                             Ok(false) => running = false, // graceful disconnect
@@ -293,6 +323,42 @@ where
                     }
                     Err(e) => {
                         debug!(error = %e, "client read failed");
+                        running = false;
+                    }
+                }
+            }
+
+            _ = tokio::time::sleep_until(next_ping_at) => {
+                if let Some(idle) = idle_deadline {
+                    if last_inbound.elapsed() >= idle {
+                        info!(idle_secs = cfg.idle_timeout_secs, "session idle timeout, closing");
+                        running = false;
+                        continue;
+                    }
+                }
+                if unanswered_pings >= MAX_UNANSWERED_PINGS {
+                    warn!(
+                        pings = unanswered_pings,
+                        "client unresponsive to liveness probes, closing session"
+                    );
+                    running = false;
+                    continue;
+                }
+                // 发送 SVC PING（客户端 TunnelChannel::process 自动回 PONG）。
+                let svc_msg: Vec<ironrdp_svc::SvcMessage> =
+                    vec![rdptun_proto::RawTunnelPdu(rdptun_proto::encode_frame(rdptun_proto::CTRL_PING)).into()];
+                match server_encode_svc_messages(svc_msg, tunnel_channel_id, user_channel_id) {
+                    Ok(encoded) => {
+                        if writer.write_all(&encoded).await.is_err() {
+                            running = false;
+                            continue;
+                        }
+                        unanswered_pings += 1;
+                        next_ping_at = tokio::time::Instant::now() + PING_INTERVAL;
+                        debug!("sent liveness ping");
+                    }
+                    Err(e) => {
+                        debug!(error = %format!("{e:#}"), "encode ping failed");
                         running = false;
                     }
                 }

@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use tracing::info;
+use tokio::sync::OwnedSemaphorePermit;
+use tracing::{info, warn};
 
 #[derive(Debug, clap::Parser)]
 struct Args {
@@ -64,15 +65,27 @@ async fn main() -> Result<()> {
             loop {
                 let (stream, peer) = listener.accept().await?;
                 stream.set_nodelay(true).ok();
+                // keepalive + 重传超时：静默死亡的连接能在 ~2 分钟内被发现并回收
+                rdptun_proto::net::tune_long_lived(&stream).ok();
 
                 let cfg = Arc::clone(&cfg);
                 let tls = Arc::clone(&tls_acceptor);
-                let sessions = Arc::clone(&sessions);
                 let pub_key = pub_key.clone();
+
+                // 许可槽等待期间检测客户端关闭/放弃，避免僵尸连接占着 backlog。
+                let permit = match wait_session_slot(&stream, &sessions).await {
+                    Ok(p) => p,
+                    Err(reason) => {
+                        warn!(%peer, %reason, "dropping connection before handshake");
+                        continue;
+                    }
+                };
+                let in_use = cfg.max_sessions - sessions.available_permits();
+                info!(%peer, in_use, max = cfg.max_sessions, "session slot acquired");
 
                 tokio::task::spawn_local(async move {
                     let started = std::time::Instant::now();
-                    match server::run_connection(stream, cfg, tls, pub_key, sessions).await {
+                    match server::run_connection(stream, cfg, tls, pub_key, permit).await {
                         Ok(()) => info!(%peer, elapsed = ?started.elapsed(), "connection finished"),
                         Err(e) => info!(%peer, error = %format!("{e:#}"), elapsed = ?started.elapsed(), "connection ended"),
                     }
@@ -80,4 +93,31 @@ async fn main() -> Result<()> {
             }
         })
         .await
+}
+
+/// 等待会话许可槽：
+/// - 客户端在等待期间关闭连接（peek 到 EOF）→ 放弃；
+/// - 超过 30s 拿不到槽 → 放弃（客户端会快速失败并重试）。
+async fn wait_session_slot(
+    stream: &tokio::net::TcpStream,
+    sessions: &Arc<tokio::sync::Semaphore>,
+) -> Result<OwnedSemaphorePermit, String> {
+    let mut buf = [0u8; 1];
+    loop {
+        tokio::select! {
+            p = sessions.clone().acquire_owned() => {
+                return p.map_err(|_| "server shutting down".to_owned());
+            }
+            r = stream.peek(&mut buf) => {
+                match r {
+                    Ok(0) => return Err("client closed while waiting for slot".to_owned()),
+                    Ok(_) => { /* 客户端已发送数据（X.224 请求），继续等槽 */ }
+                    Err(e) => return Err(format!("peek failed: {e}")),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                return Err("no session slot within 30s".to_owned());
+            }
+        }
+    }
 }

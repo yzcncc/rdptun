@@ -325,6 +325,7 @@ async fn run_session(
             data = bridge.recv_from_channel() => {
                 match data {
                     Some(d) if d.is_empty() && !remote_eof => {
+                        debug!(len = d.len(), "bridge recv (EOF marker)");
                         // 空帧 = target EOF → 半关闭本地写端。
                         debug!("target EOF received, half-closing local write side");
                         remote_eof = true;
@@ -333,6 +334,7 @@ async fn run_session(
                     }
                     Some(_d) if remote_eof => Vec::new(), // EOF 后的残余，忽略
                     Some(d) => {
+                        debug!(len = d.len(), head = ?d.get(..8), "bridge recv -> local");
                         stats.add_down(d.len());
                         if local_write.write_all(&d).await.is_err() {
                             debug!("local write failed, ending session");

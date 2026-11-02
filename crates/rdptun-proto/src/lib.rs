@@ -134,7 +134,8 @@ impl SvcProcessor for TunnelChannel {
 
     fn process(&mut self, payload: &[u8]) -> PduResult<Vec<SvcMessage>> {
         // 入站：对端发来的长度前缀帧（可能一帧或多帧粘连）。
-        // 重组后按帧边界投递给桥接任务（写入 TCP）。
+        // 重组后按帧边界处理：控制帧就地消费，数据帧投递给桥接任务（写入 TCP）。
+        let mut replies: Vec<SvcMessage> = Vec::new();
         let mut pos = 0usize;
         while pos < payload.len() {
             if payload.len() - pos < 4 {
@@ -159,10 +160,21 @@ impl SvcProcessor for TunnelChannel {
                 );
                 return Err(pdu_other_err!("truncated tunnel frame body"));
             }
-            self.deliver_to_bridge(payload[start..start + len].to_vec());
+            let data = &payload[start..start + len];
+
+            if len == 4 && data == CTRL_PING {
+                // 保活探测：回 PONG（控制帧不透传给应用数据流）。
+                replies.push(SvcMessage::from(RawTunnelPdu(encode_frame(CTRL_PONG))));
+            } else if len == 4 && data == CTRL_PONG {
+                // 对端对我们 PING 的回应：仅证明链路存活。
+            } else {
+                // len == 0 的帧是 EOF 标记（target/本地 socket 关闭）。
+                tracing::debug!(len, head = ?data.get(..8), "tunnel frame delivered to bridge");
+                self.deliver_to_bridge(data.to_vec());
+            }
             pos = start + len;
         }
-        Ok(Vec::new())
+        Ok(replies)
     }
 }
 
@@ -198,6 +210,12 @@ impl TunnelBridge {
         self.channel_to_tcp_rx.lock().await.recv().await
     }
 }
+
+/// 控制帧载荷（隧道层保留值，不透传给应用数据流）：
+/// - PING/PONG：链路保活 + 死会话检测（服务端在静默期发送，对端自动回 PONG）
+/// - 空载荷（长度=0 的帧）：EOF 标记
+pub const CTRL_PING: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF];
+pub const CTRL_PONG: &[u8] = &[0xFE, 0xFE, 0xFE, 0xFE];
 
 /// 长连接套接字调优：让"静默死亡"的连接（丢包/NAT 超时后收不到 RST）
 /// 能在约 2 分钟内被发现，而不是让会话任务永久挂起。
@@ -276,5 +294,25 @@ mod tests {
         let (channel, bridge) = new_tunnel_channel("TUNNEL").unwrap();
         bridge.send_to_channel(vec![9, 9]).await.unwrap();
         assert_eq!(channel.take_outbound().await.unwrap(), vec![9, 9]);
+    }
+
+    #[tokio::test]
+    async fn ping_gets_pong_and_is_not_delivered() {
+        let (mut channel, bridge) = new_tunnel_channel("TUNNEL").unwrap();
+        let replies = channel.process(&encode_frame(CTRL_PING)).unwrap();
+        // PING 必须得到 PONG 回应，且不透传给应用数据流
+        assert_eq!(replies.len(), 1, "PING must be answered with a PONG");
+        let pong = replies[0].encode_unframed_pdu().unwrap();
+        assert_eq!(pong, encode_frame(CTRL_PONG).to_vec());
+        // PING 不应投递任何数据到桥接：随后发送的数据帧必须是桥接收到的第一帧。
+        bridge.send_to_channel(b"zz".to_vec()).await.unwrap();
+        assert_eq!(channel.take_outbound().await.unwrap(), b"zz".to_vec());
+    }
+
+    #[tokio::test]
+    async fn pong_is_consumed_silently() {
+        let (mut channel, _bridge) = new_tunnel_channel("TUNNEL").unwrap();
+        let replies = channel.process(&encode_frame(CTRL_PONG)).unwrap();
+        assert!(replies.is_empty());
     }
 }
